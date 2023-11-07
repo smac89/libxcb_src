@@ -18,6 +18,7 @@ AM_PATH_PYTHON([3.0])
 # Must be called before any macros that run the compiler (like AC_PROG_LIBTOOL)
 # to avoid autoconf errors.
 AC_USE_SYSTEM_EXTENSIONS
+AC_SYS_LARGEFILE
 
 # Initialize libtool
 LT_PREREQ([2.2])
