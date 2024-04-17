@@ -1,0 +1,90 @@
+name: 'Generate libxcb sources'
+
+on:
+  schedule:
+    - cron: '0 0 */7 * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_SOURCE: ${{ vars.UPSTREAM_SOURCE }}
+  COMMITTER_EMAIL: ${{ vars.COMMITTER_EMAIL }}
+  XCBPROTO_VER:    ${{ vars.DEPS_XCBPROTO }}
+  UTIL_MACROS_VER: ${{ vars.DEPS_UTIL_MACROS }}
+
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 'Fetch deps'
+        run: |
+          install -dm755 /var/tmp/{util-macros,xcb-proto}
+          wget -O util-macros.tar.xz "https://www.x.org/pub/individual/util/util-macros-${UTIL_MACROS_VER}.tar.xz"
+          tar -xvf util-macros.tar.xz --strip-components=1 --directory=/var/tmp/util-macros
+          wget -O xcb-proto.tar.xz "https://xorg.freedesktop.org/archive/individual/proto/xcb-proto-${XCBPROTO_VER}.tar.xz"
+          tar -xvf xcb-proto.tar.xz --strip-components=1 --directory=/var/tmp/xcb-proto
+      - name: 'Install deps'
+        run: |
+          pushd util-macros
+          ./configure $XORG_CONFIG
+          sudo make install && popd
+          pushd xcb-proto
+          PYTHON=python3 ./configure $XORG_CONFIG
+          sudo make install && popd
+        working-directory: /var/tmp
+        env:
+          XORG_CONFIG: --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-static
+      - name: 'GPG setup'
+        run: |
+          sudo apt install --yes -q gnupg
+          export GNUPGHOME="$(mktemp -d)"
+          GPG_KEYFILE="$(mktemp --suffix=.asc)"
+          GPG_KEYFILE_PUB="$(mktemp --suffix=.key)"
+          echo '${{ vars.GPG_KEYFILE_PUB }}' > "$GPG_KEYFILE_PUB"
+          echo '${{ secrets.GPG_KEYFILE }}' > "$GPG_KEYFILE"
+          gpg --verbose --import <"$GPG_KEYFILE_PUB"
+          gpg --verbose --batch --import <"$GPG_KEYFILE"
+          mapfile -t ids < <(gpg --verbose --show-keys --with-colons --with-keygrip < "$GPG_KEYFILE_PUB" | \
+            $GITHUB_WORKSPACE/.github/workflows/scripts/extract_gpg_id_and_grip.awk
+          )
+          GPG_KEYID=${ids[0]}
+          GPG_KEYGRIP=${ids[1]}
+
+          gpgconf --kill all
+          install -Dm640 <(echo "default-key $GPG_KEYID") $GNUPGHOME/gpg.conf
+          echo 'pinentry-mode loopback' >> $GNUPGHOME/gpg.conf
+          install -Dm640 <(echo "allow-loopback-pinentry") $GNUPGHOME/gpg-agent.conf
+          echo 'allow-preset-passphrase' >> $GNUPGHOME/gpg-agent.conf
+          gpgconf --launch all
+
+          /usr/lib/gnupg/gpg-preset-passphrase --verbose --preset "${GPG_KEYGRIP}" <<EOF
+          ${{ secrets.GPG_KEYPASS }}
+          EOF
+          {
+            echo "GNUPGHOME=$GNUPGHOME"
+            echo "GPG_KEYID=$GPG_KEYID"
+          } >> $GITHUB_ENV
+      - if: runner.debug == '1'
+        run: echo "GIT_TRACE=1" >> $GITHUB_ENV
+      - name: 'Pull latest sources from upstream'
+        run: |
+          git remote add upstream "$UPSTREAM_SOURCE"
+          git fetch upstream master
+          git checkout -b upstream --track upstream/master
+          git config --global user.name 'actions'
+          git config --global user.email "${COMMITTER_EMAIL}"
+          git config --global commit.gpgsign true
+          git config --global gpg.program /usr/bin/gpg2
+          git config --global user.signingkey "$GPG_KEYID"
+      - name: 'Generate sources'
+        run: |
+          ./autogen.sh
+          make distdir
+          git add --force src/*.c
+          git checkout master -- .github
+          git stash
+      - name: 'Commit the changes'
+        run: |
+          git checkout master
+          git merge --ff --strategy-option=theirs --commit --signoff --message='[actions] Generated sources :books:' stash
+          git push origin master
